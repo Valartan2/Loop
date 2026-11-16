@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Horde — prototype de survie</title>
+<style>
+  :root{color-scheme:dark;--panel:#19232ecc;--line:#2b3a49;--muted:#9eafbd;--cyan:#56c7ff}
+  *{box-sizing:border-box;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000000;font:15px system-ui,Segoe UI,sans-serif;color:#eef5fa}
+  canvas{display:block;width:100%;height:100%;touch-action:none;cursor:crosshair}
+  .hud{position:fixed;top:max(12px,env(safe-area-inset-top));left:12px;right:12px;display:flex;justify-content:space-between;align-items:flex-start;gap:8px;pointer-events:none;z-index:2}
+  .stats{display:flex;gap:6px;flex-wrap:wrap}
+  .stat{background:var(--panel);backdrop-filter:blur(6px);border:1px solid var(--line);padding:6px 10px;border-radius:10px;min-width:68px}
+  .stat b{display:block;font-size:16px}
+  .stat small{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+  .hp-bar{display:flex;gap:4px;margin-top:5px}
+  .hp-bar i{display:block;height:6px;width:12px;border-radius:3px;background:#2b3a49;transition:background .15s}
+  .hp-bar i.on{background:#ff626b;box-shadow:0 0 6px #ff626b88}
+  .wave{background:var(--panel);backdrop-filter:blur(6px);border:1px solid var(--line);padding:6px 10px;border-radius:10px;font-size:11px;font-weight:600;color:var(--cyan);letter-spacing:.06em;white-space:nowrap}
+  .overlay{position:fixed;inset:0;display:none;place-items:center;background:#05090dd9;text-align:center;padding:24px;z-index:10}
+  .overlay.show{display:grid}
+  .modal{max-width:340px}
+  .modal h2{font-size:32px;margin:0 0 8px}
+  .modal p{color:#c0ccd5;line-height:1.5;margin:0 0 20px}
+  button.reset{background:var(--cyan);border:none;color:#08121a;font-weight:700;font-size:15px;padding:12px 24px;border-radius:12px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="hud">
+ <div class="stats">
+  <div class="stat"><small>Vie</small><div class="hp-bar" id="hpBar"><i></i><i></i><i></i><i></i><i></i></div></div>
+  <div class="stat"><small>Temps</small><b id="time">00:00</b></div>
+  <div class="stat"><small>Ennemis</small><b id="enemies">0</b></div>
+  <div class="stat"><small>Objectif</small><b id="kills">0 / 500</b></div>
+  <div class="stat"><small>Serpent</small><b id="netLen">340</b></div>
+ </div>
+ <div class="wave" id="waveLabel">VAGUE 1</div>
+</div>
+<canvas id="game"></canvas>
+<div class="overlay" id="overlay"><div class="modal"><h2 id="endTitle">Attrapé !</h2><p id="endText"></p><button class="reset" onclick="restart()">Rejouer</button></div></div>
+<script>
+const canvas=document.getElementById('game'),ctx=canvas.getContext('2d',{alpha:false});
+let W=window.innerWidth,H=window.innerHeight;
+const DEAD_MOUSE=18,DEAD_TOUCH=12,LOOP_MIN=90,LOOP_SNAP=14;
+const START_NET_LEN=340,MAX_NET_CAP=2000;
+const GOAL_1=500,GOAL_2=1000; // objectifs de captures : 500 puis 1000 (victoire)
+let drag=null,catches=[],sid=0,strokeLen=0,maxNetLen=START_NET_LEN,netLastPt=null,wave=0,msg='',msgT=0;
+let player,enemies,nets,elapsed,last,spawnTimer,dead,killsCount=0,reached500=false,lastSec=-1,lastCount=-1,lastWave=-1,lastHp=-1,lastKills=-1,lastNet=-1;
+const $=id=>document.getElementById(id);
+
+function resize(){
+ const dpr=Math.min(window.devicePixelRatio||1,2);
+ W=window.innerWidth;
+ H=window.innerHeight;
+ canvas.width=Math.floor(W*dpr);
+ canvas.height=Math.floor(H*dpr);
+ ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+window.addEventListener('resize',resize);
+resize();
+
+function restart(){
+ player={x:0,y:0,px:0,py:0,r:10,speed:190,inv:0,dir:0};
+ enemies=[];nets=[];catches=[];
+ elapsed=0;last=0;spawnTimer=9.5;wave=0;msg='';msgT=0;killsCount=0;reached500=false;
+ sid=0;strokeLen=0;maxNetLen=START_NET_LEN;netLastPt=null;dead=false;drag=null;
+ lastSec=-1;lastCount=-1;lastWave=-1;lastHp=-1;lastKills=-1;lastNet=-1;
+ $('overlay').classList.remove('show');
+ updateUI(true);
+ requestAnimationFrame(loop);
+}
+
+function updateUI(force){
+ const tier=Math.ceil(maxNetLen/(MAX_NET_CAP/5));
+ if(force||tier!==lastHp){
+  lastHp=tier;
+  const pips=$('hpBar').children;
+  for(let i=0;i<pips.length;i++)pips[i].classList.toggle('on',i<lastHp);
+ }
+ const sec=Math.floor(elapsed);
+ if(force||sec!==lastSec){
+  lastSec=sec;
+  $('time').textContent=String(Math.floor(sec/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0');
+ }
+ if(force||enemies.length!==lastCount){
+  lastCount=enemies.length;
+  $('enemies').textContent=lastCount;
+ }
+ if(force||killsCount!==lastKills){
+  lastKills=killsCount;
+  $('kills').textContent=lastKills+' / '+(lastKills>=GOAL_1?GOAL_2:GOAL_1);
+ }
+ const nl=Math.round(maxNetLen);
+ if(force||nl!==lastNet){
+  lastNet=nl;
+  $('netLen').textContent=lastNet;
+ }
+ const w=Math.max(1,wave);
+ if(force||w!==lastWave){
+  lastWave=w;
+  $('waveLabel').textContent='VAGUE '+w;
+ }
+}
+
+const TIERS=[null,{r:6,speed:88,color:'#ff7777'},{r:10,speed:57,color:'#e24b55'},{r:15,speed:34,color:'#a92e42'}];
+
+function spawn(a,R,speedScale=1,maxTier=3){
+ const x=player.x+Math.cos(a)*R,y=player.y+Math.sin(a)*R;
+ const roll=Math.random();
+ let hp=roll<.65?1:roll<.91?2:3;
+ if(hp>maxTier)hp=maxTier;
+ const t=TIERS[hp];
+ enemies.push({x,y,r:t.r,hp,hitT:0,speed:t.speed*speedScale,side:Math.random()<.5?1:-1,lock:0,dead:false,lead:Math.random()<.55?.5+Math.random()*.5:0});
+}
+
+const GAP=70,MAX_ENEMIES=240;
+// Montée en pression au fil du temps : plafond d'ennemis, taille des groupes et nombre de fronts
+function maxEnemies(){return Math.min(650,MAX_ENEMIES+Math.floor(elapsed/60)*20)}
+function timePressure(){return Math.min(1,Math.max(0,(elapsed-90)/840))} // 0 jusqu'à 1:30, plein effet vers 15:30
+// Période de grâce : les comportements agressifs (interception, vagues devant toi) montent en douceur entre 1:30 et 4:30
+function grace(){return Math.min(1,Math.max(0,(elapsed-90)/180))}
+const WAVE_START=11.5,WAVE_MIN=1.8;
+function spawnWave(){
+ if(enemies.length>=maxEnemies())return;
+ wave++;
+ const R0=Math.hypot(W,H)/2+55;
+ // Progression basée principalement sur la taille du serpent (340 -> 3200)
+ const netRatio=Math.max(0,(maxNetLen-START_NET_LEN)/(MAX_NET_CAP-START_NET_LEN));
+ const netBonus=Math.floor((maxNetLen-START_NET_LEN)/75);
+
+ // La taille totale de la horde grandit directement avec la longueur du serpent
+ const tp=timePressure();
+ const timeBonus=Math.floor(tp*150);              // jusqu'à +150 ennemis par vague avec le temps
+ const waveCap=65+Math.floor(tp*195);             // plafond par vague : 65 -> 260
+ let totalEnemies=Math.min(waveCap,5+netBonus+timeBonus+Math.floor(wave*0.45));
+ if(wave===1)totalEnemies=5;
+
+ const speedScale=(netRatio<0.05&&elapsed<90?0.78:1)*(1+0.6*tp); // les ennemis accélèrent avec le temps
+ const maxTier=netRatio<0.06?1:(netRatio<0.22?2:3);
+
+ // Les ennemis arrivent par groupes directionnels (1 à 2 fronts) au lieu d'un cercle complet,
+ // laissant toujours un espace ouvert pour esquiver et manœuvrer
+ let fronts=netRatio>0.35&&wave>3?2:1;
+ // Avec le temps, la horde arrive depuis plusieurs directions à la fois
+ if(elapsed>120)fronts=Math.max(fronts,2);
+ if(elapsed>200)fronts=Math.max(fronts,3);
+ if(elapsed>300)fronts=Math.max(fronts,4);
+ if(elapsed>450)fronts=Math.max(fronts,6);
+ if(elapsed>650)fronts=Math.max(fronts,8);
+ if(elapsed>850)fronts=12; // encerclement complet
+ // Souvent, la vague arrive dans la direction où tu cours : fuir en ligne droite ne dégage plus la voie
+ const moving=!!(player.vx||player.vy);
+ const baseAngle=(moving&&Math.random()<.65*grace())?player.dir+(Math.random()-.5)*.9:Math.random()*Math.PI*2;
+ let spread=Math.min(Math.PI*0.72,0.45+netRatio*0.4); // Arc limité (~25° à ~65°)
+ // Avec plusieurs fronts, chaque groupe s'étale jusqu'à rejoindre le voisin : plus aucun côté libre
+ if(fronts>=3)spread=Math.max(spread,(Math.PI*2/fronts)*Math.min(1,0.55+tp*0.6));
+
+ for(let f=0;f<fronts;f++){
+  const frontAngle=fronts<=2
+   ?baseAngle+(f===1?(Math.PI*0.65+(Math.random()-0.5)*0.4):0)
+   :baseAngle+f*(Math.PI*2/fronts)+(Math.random()-0.5)*0.4;
+  const count=Math.ceil(totalEnemies/fronts);
+  for(let i=0;i<count;i++){
+   if(enemies.length>=maxEnemies())break;
+   const t=count>1?(i/(count-1)-0.5):0;
+   const angle=frontAngle+t*spread+(Math.random()-0.5)*0.08;
+   const dist=R0+Math.random()*130;
+   spawn(angle,dist,speedScale,maxTier);
+  }
+ }
+}
+
+const SD={d:0,cx:0,cy:0};
+function segDist(px,py,s){
+ const dx=s.x2-s.x1,dy=s.y2-s.y1,l2=dx*dx+dy*dy||1;
+ let t=((px-s.x1)*dx+(py-s.y1)*dy)/l2;t=Math.max(0,Math.min(1,t));
+ SD.cx=s.x1+dx*t;SD.cy=s.y1+dy*t;SD.d=Math.hypot(px-SD.cx,py-SD.cy);return SD;
+}
+
+function inPoly(x,y,pts){
+ let c=false;
+ for(let i=0,j=pts.length-1;i<pts.length;j=i++){
+  const a=pts[i],b=pts[j];
+  if((a.y>y)!==(b.y>y)&&x<(b.x-a.x)*(y-a.y)/(b.y-a.y)+a.x)c=!c;
+ }
+ return c;
+}
+
+function checkLoop(){
+ // Plus le serpent est long, plus la boucle minimale est grande : les virages et croisements
+ // sur la partie récente du tracé ne ferment plus de boucle par accident
+ const loopMin=Math.max(LOOP_MIN,Math.min(650,maxNetLen*0.3));
+ for(let i=0;i<nets.length-1;i++){
+  const n=nets[i];
+  if(n.sid!==sid||strokeLen-n.cl<loopMin)continue;
+  const q=segDist(player.x,player.y,n);
+  if(q.d<LOOP_SNAP){closeLoop(i,q.cx,q.cy);return}
+ }
+}
+
+function closeLoop(i,cx,cy){
+ const pts=[{x:cx,y:cy}];
+ for(let k=i;k<nets.length;k++)if(nets[k].sid===sid)pts.push({x:nets[k].x2,y:nets[k].y2});
+ let kills=0,shrinks=0;
+ for(const e of enemies){
+  if(!e.dead&&inPoly(e.x,e.y,pts)){
+   e.hp--;
+   e.hitT=.25;
+   if(e.hp<=0){
+    e.dead=true;
+    kills++;
+   }else{
+    const t=TIERS[e.hp];
+    e.r=t.r;
+    e.speed=t.speed;
+    shrinks++;
+   }
+  }
+ }
+ catches.push({pts,t:0});
+ nets=[];
+ sid++;strokeLen=0;netLastPt={x:player.x,y:player.y};
+
+ // Le filet grandit au fur et à mesure des captures !
+ const growth=kills*36+shrinks*18;
+ if(growth>0){
+  maxNetLen=Math.min(MAX_NET_CAP,maxNetLen+growth);
+ }
+
+ if(kills){
+  killsCount+=kills;
+  msg='+'+kills+' éliminé'+(kills>1?'s':'')+(shrinks?' ('+shrinks+' réduit'+(shrinks>1?'s':'')+')':'')+' · Serpent +'+growth;
+  msgT=1.5;
+ }else if(shrinks){
+  msg=shrinks+' ennemi'+(shrinks>1?'s':'')+' réduit'+(shrinks>1?'s':'')+' · Serpent +'+growth;
+  msgT=1.3;
+ }
+
+ if(!reached500&&killsCount>=GOAL_1){
+  reached500=true;
+  msg='Objectif '+GOAL_1+' atteint ! Prochain : '+GOAL_2;
+  msgT=3.5;
+ }
+ if(killsCount>=GOAL_2){updateUI(true);finish(true)}
+}
+
+function layLine(){
+ if(!netLastPt){netLastPt={x:player.px,y:player.py};sid++;strokeLen=0}
+ const seg=Math.hypot(player.x-netLastPt.x,player.y-netLastPt.y);
+ if(seg<6)return;
+ strokeLen+=seg;
+ nets.push({x1:netLastPt.x,y1:netLastPt.y,x2:player.x,y2:player.y,sid,cl:strokeLen});
+ netLastPt={x:player.x,y:player.y};
+ checkLoop();
+ // Si le tracé dépasse la taille actuelle du filet, l'extrémité arrière avance avec toi
+ while(nets.length>1&&strokeLen-nets[0].cl>maxNetLen){
+  nets.shift();
+ }
+}
+
+function movePlayer(dt){
+ let dx=0,dy=0,on=false;
+ if(drag){
+  if(drag.mouse){dx=drag.x-W/2;dy=drag.y-H/2;on=Math.hypot(dx,dy)>DEAD_MOUSE}
+  else if(drag.moved>DEAD_TOUCH){dx=drag.x-drag.sx;dy=drag.y-drag.sy;on=Math.hypot(dx,dy)>1}
+ }
+ if(on){
+  const l=Math.hypot(dx,dy);dx/=l;dy/=l;
+  player.dir=Math.atan2(dy,dx);
+  player.px=player.x;player.py=player.y;
+  player.vx=dx*player.speed;player.vy=dy*player.speed;
+  player.x+=dx*player.speed*dt;
+  player.y+=dy*player.speed*dt;
+  layLine();
+ }else{
+  player.px=player.x;player.py=player.y;
+  player.vx=0;player.vy=0;
+ }
+}
+
+// Les traînards sont replacés devant le joueur : la horde ne finit plus entassée derrière lui
+function recycleEnemy(e){
+ const R0=Math.hypot(W,H)/2+55;
+ const moving=!!(player.vx||player.vy);
+ const a=moving?player.dir+(Math.random()-.5)*Math.PI*1.3:Math.random()*Math.PI*2;
+ const d=R0+Math.random()*120;
+ e.x=player.x+Math.cos(a)*d;e.y=player.y+Math.sin(a)*d;e.lock=0;
+}
+
+function updateEnemies(dt){
+ const recycleDist=Math.hypot(W,H)/2+55+380;
+ for(let e of enemies){
+  if(e.dead)continue;
+  const dx=player.x-e.x,dy=player.y-e.y,l=Math.hypot(dx,dy)||1;
+  if(l>recycleDist&&elapsed>90){recycleEnemy(e);continue}
+  let vx=dx/l,vy=dy/l;
+  // Interception : certains ennemis visent l'endroit où tu vas, pas où tu es
+  if(e.lead>0&&grace()>0&&(player.vx||player.vy)){
+   const tl=Math.min(1.3,l/e.speed)*e.lead*grace();
+   const ax=player.x+player.vx*tl-e.x,ay=player.y+player.vy*tl-e.y,al=Math.hypot(ax,ay)||1;
+   vx=ax/al;vy=ay/al;
+  }
+  const speed=e.speed;
+  // Le filet n'est plus une barrière : les ennemis le traversent librement
+  const vl=Math.hypot(vx,vy)||1;vx/=vl;vy/=vl;
+  e.x+=vx*speed*dt;e.y+=vy*speed*dt;
+  if(Math.hypot(e.x-player.x,e.y-player.y)<e.r+player.r){
+   if(player.inv<=0){
+    // Plus de points de vie : chaque coup retire 1/5 du serpent maximal. Au format de base, un coup = mort.
+    if(maxNetLen<=START_NET_LEN){updateUI(true);finish(false);return}
+    maxNetLen=Math.max(START_NET_LEN,maxNetLen-MAX_NET_CAP/5);
+    while(nets.length>1&&strokeLen-nets[0].cl>maxNetLen)nets.shift();
+    player.inv=1.0;
+    msg='Touché ! Serpent '+Math.round(maxNetLen);msgT=1.2;
+   }
+  }
+ }
+}
+
+function update(dt){
+ elapsed+=dt;
+ msgT=Math.max(0,msgT-dt);
+ if(player.inv>0)player.inv=Math.max(0,player.inv-dt);
+ movePlayer(dt);
+ spawnTimer+=dt;
+ // La fréquence des vagues s'accélère proportionnellement à l'agrandissement du filet
+ const netRatio=Math.max(0,(maxNetLen-START_NET_LEN)/(MAX_NET_CAP-START_NET_LEN));
+ const interval=Math.max(0.9,WAVE_START*Math.pow(0.22,netRatio)*(1-0.65*timePressure()));
+ if(spawnTimer>interval){spawnTimer-=interval;spawnWave()}
+ updateEnemies(dt);
+ if(dead)return;
+ for(const e of enemies)if(e.hitT>0)e.hitT=Math.max(0,e.hitT-dt);
+
+ catches.forEach(c=>c.t+=dt);
+ catches=catches.filter(c=>c.t<.5);
+ enemies=enemies.filter(e=>!e.dead&&Math.hypot(e.x-player.x,e.y-player.y)<Math.max(1100,Math.hypot(W,H)/2+900));
+ if(elapsed>=3600)finish(true);
+ updateUI(false);
+}
+
+function draw(){
+ ctx.fillStyle='#000000';ctx.fillRect(0,0,W,H);
+ ctx.save();ctx.translate(Math.round(W/2-player.x),Math.round(H/2-player.y));
+
+ ctx.lineCap='round';ctx.lineJoin='round';
+ for(const c of catches){
+  const a=1-c.t/.5;
+  ctx.globalAlpha=a*.4;ctx.fillStyle='#56c7ff';
+  ctx.beginPath();c.pts.forEach((q,i)=>i?ctx.lineTo(q.x,q.y):ctx.moveTo(q.x,q.y));ctx.closePath();ctx.fill();
+  ctx.globalAlpha=a;ctx.strokeStyle='#d5f4ff';ctx.lineWidth=3;ctx.stroke();
+ }
+ ctx.globalAlpha=1;
+
+ if(nets.length>0){
+  const blink=player.inv>0&&Math.floor(player.inv*16)%2!==0;
+  if(!blink){
+   const total=nets.length;
+   ctx.lineCap='round';ctx.lineJoin='round';
+   for(let i=0;i<total;i++){
+    const t=nets[i];
+    const ratio=(i+1)/total;
+    const w=3.5+ratio*12.5;
+    ctx.beginPath();
+    ctx.moveTo(t.x1,t.y1);
+    ctx.lineTo(t.x2,t.y2);
+    ctx.strokeStyle=i%2===0?'#38b6ff':'#56c7ff';
+    ctx.lineWidth=w;
+    ctx.stroke();
+   }
+   // Bout de la queue doré pour repérer où refermer la boucle
+   if(total>4){
+    ctx.fillStyle='#ffd166';
+    ctx.beginPath();ctx.arc(nets[0].x1,nets[0].y1,4,0,Math.PI*2);ctx.fill();
+   }
+  }
+ }
+
+ if(player.inv<=0||Math.floor(player.inv*16)%2===0){
+  ctx.save();
+  ctx.translate(player.x,player.y);
+  ctx.rotate(player.dir);
+  // Tête du serpent
+  ctx.fillStyle='#56c7ff';
+  ctx.beginPath();
+  ctx.ellipse(2,0,12.5,9.5,0,0,Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle='#d5f4ff';
+  ctx.lineWidth=1.8;
+  ctx.stroke();
+  // Langue bifide
+  const tongue=Math.sin(elapsed*18)*2.5;
+  ctx.strokeStyle='#ff626b';
+  ctx.lineWidth=1.6;
+  ctx.beginPath();
+  ctx.moveTo(14,0);
+  ctx.lineTo(19+tongue,0);
+  ctx.lineTo(22+tongue,-2.5);
+  ctx.moveTo(19+tongue,0);
+  ctx.lineTo(22+tongue,2.5);
+  ctx.stroke();
+  // Yeux et pupilles
+  ctx.fillStyle='#ffffff';
+  ctx.beginPath();ctx.arc(5,-4.5,2.8,0,Math.PI*2);ctx.arc(5,4.5,2.8,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#08121a';
+  ctx.beginPath();ctx.arc(6,-4.5,1.4,0,Math.PI*2);ctx.arc(6,4.5,1.4,0,Math.PI*2);ctx.fill();
+  ctx.restore();
+ }
+
+ for(let e of enemies){
+  ctx.fillStyle=e.hitT>0?'#ffffff':TIERS[e.hp].color;
+  ctx.beginPath();ctx.arc(e.x,e.y,e.r,0,Math.PI*2);ctx.fill();
+ }
+ ctx.restore();
+
+ if(msgT>0){
+  ctx.fillStyle='#ffd166';ctx.font='bold 15px system-ui';ctx.textAlign='center';
+  ctx.fillText(msg,W/2,86);ctx.textAlign='left';
+ }
+}
+
+function finish(win){
+ if(dead)return;
+ dead=true;
+ $('endTitle').textContent=win?'Échappé !':'Attrapé !';
+ $('endText').textContent=win?(killsCount>=GOAL_2?'Tu as capturé '+killsCount+' ennemis en '+Math.floor(elapsed/60)+' min '+Math.floor(elapsed%60)+' s !':'Tu as tenu une heure !'):'Tu as survécu '+Math.floor(elapsed/60)+' min '+Math.floor(elapsed%60)+' s et éliminé '+killsCount+' ennemi'+(killsCount>1?'s':'')+'.';
+ $('overlay').classList.add('show');
+}
+
+function loop(ts){
+ if(dead)return;
+ if(!last)last=ts;
+ const dt=Math.min(.035,(ts-last)/1000);
+ last=ts;
+ update(dt);
+ draw();
+ if(!dead)requestAnimationFrame(loop);
+}
+
+function pos(e){return{x:e.clientX,y:e.clientY}}
+canvas.addEventListener('pointerdown',e=>{
+ if(e.pointerType==='mouse')return;
+ const p=pos(e);
+ drag={mouse:false,sx:p.x,sy:p.y,x:p.x,y:p.y,moved:0,id:e.pointerId};
+ canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove',e=>{
+ const p=pos(e);
+ if(e.pointerType==='mouse'){drag={mouse:true,x:p.x,y:p.y,sx:p.x,sy:p.y,moved:99};return}
+ if(drag&&!drag.mouse&&e.pointerId===drag.id){
+  drag.x=p.x;drag.y=p.y;
+  drag.moved=Math.max(drag.moved,Math.hypot(p.x-drag.sx,p.y-drag.sy));
+ }
+});
+const endDrag=e=>{if(drag&&(drag.mouse?e.pointerType==='mouse':e.pointerId===drag.id))drag=null};
+canvas.addEventListener('pointerup',endDrag);
+canvas.addEventListener('pointercancel',endDrag);
+canvas.addEventListener('pointerleave',endDrag);
+restart();
+</script>
+</body></html>
